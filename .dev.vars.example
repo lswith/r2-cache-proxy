@@ -1,0 +1,6 @@
+# Local dev secrets for `wrangler dev`. Copy to `.dev.vars` (gitignored) and
+# fill in. In production this is set via `wrangler secret put MIRROR_SECRET`.
+
+# Shared token every request must present via HTTP Basic auth (any username,
+# this value as the password). Generate with: openssl rand -hex 32
+MIRROR_SECRET=
