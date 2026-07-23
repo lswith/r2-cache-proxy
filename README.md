@@ -162,6 +162,12 @@ APM needed.
   Bazel deps are https in practice; http upstreams aren't mirror-able.
 - **Concurrent misses** for the same key both fetch and `put` (last write wins,
   identical bytes) — fine for immutable build artifacts.
+- **Size ceiling (~128 MB).** On a miss the worker buffers the object in memory
+  before storing it — R2 `put()` needs a known length, which an
+  auto-decompressed or chunked upstream body doesn't have. So a single artifact
+  is bounded by the 128 MB worker memory limit. Bazel deps are almost always
+  well under this; mirroring artifacts larger than that would need multipart
+  streaming (not yet implemented).
 - **Refreshing a cached object** (e.g. an upstream re-tagged a release): delete
   the key from the bucket and the next request re-fetches it —
   `pnpm exec wrangler r2 object delete lswith-bazel-mirror/<host>/<path>`.

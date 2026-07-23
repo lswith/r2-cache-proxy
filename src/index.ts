@@ -124,6 +124,89 @@ function serveObject(
   return new Response(isHead ? null : body, { status: 200, headers });
 }
 
+// R2 requires every multipart part except the last to be >= 5 MiB. Use 10 MiB
+// parts: memory stays flat at ~one part regardless of object size, and even a
+// multi-GB artifact stays well under the ~1000-subrequest-per-invocation limit.
+const PART_SIZE = 10 * 1024 * 1024;
+
+function concat(chunks: Uint8Array[], length: number): Uint8Array {
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Read from `reader` until at least `partSize` bytes are accumulated or the
+ * stream ends. `done` is true only when the stream is exhausted.
+ */
+async function readPart(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  partSize: number,
+): Promise<{ data: Uint8Array; done: boolean }> {
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (length < partSize) {
+    const { done, value } = await reader.read();
+    if (done) return { data: concat(chunks, length), done: true };
+    chunks.push(value);
+    length += value.byteLength;
+  }
+  return { data: concat(chunks, length), done: false };
+}
+
+/**
+ * Stream `body` into R2 without buffering the whole object: bodies that fit in
+ * one part use a single `put()` (cheaper, and dodges the 5 MiB min-part rule on
+ * small files); larger bodies stream through a multipart upload, holding ~one
+ * part in memory at a time. This is why object size is bounded by R2's limits
+ * rather than the 128 MB worker memory limit. `partSize` is injectable for
+ * tests. Aborts the multipart upload if anything fails, then rethrows.
+ */
+export async function storeToR2(
+  bucket: R2Bucket,
+  key: string,
+  body: ReadableStream<Uint8Array>,
+  httpMetadata: R2HTTPMetadata,
+  partSize: number = PART_SIZE,
+): Promise<void> {
+  const reader = body.getReader();
+  const first = await readPart(reader, partSize);
+  if (first.done) {
+    // Whole body fit in one part — plain single-shot put.
+    await bucket.put(key, first.data, { httpMetadata });
+    return;
+  }
+
+  const mpu = await bucket.createMultipartUpload(key, { httpMetadata });
+  try {
+    const parts: R2UploadedPart[] = [];
+    let partNumber = 1;
+    let part = first;
+    while (true) {
+      parts.push(await mpu.uploadPart(partNumber, part.data));
+      partNumber += 1;
+      if (part.done) break;
+      part = await readPart(reader, partSize);
+      // The stream can end exactly on a part boundary → a 0-byte trailing read.
+      // Don't upload an empty part.
+      if (part.done && part.data.byteLength === 0) break;
+    }
+    await mpu.complete(parts);
+  } catch (err) {
+    try {
+      await mpu.abort();
+    } catch {
+      // Best-effort cleanup of the dangling upload; surface the original error.
+    }
+    throw err;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -183,17 +266,25 @@ export default {
         });
       }
 
-      // 6. Store-then-serve. put() streams the body into R2 (so large archives
-      // stay within the 128 MB memory limit); then re-get so Range/conditional
-      // on the populating request go through the same serve path as a hit.
-      // Concurrent misses for the same key both fetch+put (last write wins,
-      // identical bytes) — acceptable for immutable build artifacts.
-      await env.MIRROR.put(key, upstreamResp.body, {
-        httpMetadata: {
+      // 6. Store-then-serve, streaming the body into R2 in bounded-size parts so
+      // object size is limited by R2 (up to 5 TB), not the 128 MB worker memory.
+      // R2 needs a known length per write, which an auto-decompressed or chunked
+      // upstream body lacks — storeToR2 accumulates fixed-size parts (single
+      // put() for small bodies, multipart for large) to supply one. Concurrent
+      // misses for the same key both store (last write wins, identical bytes) —
+      // fine for immutable build artifacts.
+      try {
+        await storeToR2(env.MIRROR, key, upstreamResp.body, {
           contentType: upstreamResp.headers.get("content-type") ?? "application/octet-stream",
-        },
-      });
-      log.info("cached upstream object", { key, upstream });
+        });
+        log.info("cached upstream object", { key, upstream });
+      } catch (err) {
+        log.err("failed to store upstream object", err, { key, upstream });
+        return new Response("Bad Gateway\n", {
+          status: 502,
+          headers: { "x-mirror-status": "miss-error" },
+        });
+      }
 
       const stored = await env.MIRROR.get(key, { range: request.headers, onlyIf: request.headers });
       if (stored === null) {
