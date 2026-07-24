@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Read-only smoke test for the Bazel R2 mirror.
+ * Read-only smoke test for a deployed r2-cache-proxy.
  *
  * Fetches a small, stable public file through the mirror twice and asserts both
  * requests return 200 with identical bytes and that the second is served from
@@ -11,23 +11,27 @@
  * hit — either is fine, the invariant is "second request is served from cache
  * and the bytes match".
  *
- * Usage (MIRROR_SECRET comes from your shell env — see ~/.secrets.zsh):
- *   node scripts/smoke.mjs
+ * Usage (MIRROR_BASE/MIRROR_USER/MIRROR_SECRET come from your shell env):
+ *   MIRROR_BASE=https://r2-cache-proxy.<you>.workers.dev MIRROR_USER=mirror MIRROR_SECRET=... node scripts/smoke.mjs
  *   MIRROR_BASE=http://localhost:8787 node scripts/smoke.mjs   # vs `wrangler dev`
  */
 
-const BASE = process.env.MIRROR_BASE ?? "https://bazel-mirror.lswith.io";
+const BASE = process.env.MIRROR_BASE;
+const USER = process.env.MIRROR_USER;
 const SECRET = process.env.MIRROR_SECRET;
-// A small, stable file, addressed Bazel-style as host/path (no scheme).
-const SAMPLE =
-  process.env.MIRROR_SAMPLE ?? "raw.githubusercontent.com/bazelbuild/bazel/master/.bazelversion";
+// A small, stable, neutral public file, addressed as host/path (no scheme).
+const SAMPLE = process.env.MIRROR_SAMPLE ?? "raw.githubusercontent.com/octocat/Hello-World/master/README";
 
-if (!SECRET) {
-  console.error("MIRROR_SECRET not set. Export it (see ~/.secrets.zsh) and retry.");
+if (!BASE) {
+  console.error("MIRROR_BASE not set — the deployed mirror's origin, e.g. https://r2-cache-proxy.<you>.workers.dev");
+  process.exit(1);
+}
+if (!USER || !SECRET) {
+  console.error("MIRROR_USER and/or MIRROR_SECRET not set. Export both and retry.");
   process.exit(1);
 }
 
-const auth = "Basic " + Buffer.from(`bazel:${SECRET}`).toString("base64");
+const auth = "Basic " + Buffer.from(`${USER}:${SECRET}`).toString("base64");
 const url = `${BASE}/${SAMPLE}`;
 
 async function get(label) {

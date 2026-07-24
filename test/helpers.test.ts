@@ -26,28 +26,33 @@ describe("deriveKey", () => {
 });
 
 describe("checkAuth", () => {
+  const user = "mirror";
   const secret = "s3cr3t";
-  const basic = (user: string, pass: string): string => "Basic " + btoa(`${user}:${pass}`);
+  const basic = (u: string, pass: string): string => "Basic " + btoa(`${u}:${pass}`);
 
-  it("accepts the correct password with any username", () => {
-    expect(checkAuth(basic("bazel", secret), secret)).toBe(true);
-    expect(checkAuth(basic("anyone", secret), secret)).toBe(true);
+  it("accepts the correct username and password", () => {
+    expect(checkAuth(basic(user, secret), user, secret)).toBe(true);
   });
 
   it("rejects a wrong password", () => {
-    expect(checkAuth(basic("bazel", "nope"), secret)).toBe(false);
+    expect(checkAuth(basic(user, "nope"), user, secret)).toBe(false);
+  });
+
+  it("rejects a wrong username", () => {
+    expect(checkAuth(basic("someone-else", secret), user, secret)).toBe(false);
   });
 
   it("rejects a missing or non-Basic header", () => {
-    expect(checkAuth(null, secret)).toBe(false);
-    expect(checkAuth("Bearer xyz", secret)).toBe(false);
+    expect(checkAuth(null, user, secret)).toBe(false);
+    expect(checkAuth("Bearer xyz", user, secret)).toBe(false);
   });
 
-  it("rejects when the secret is unset (fail closed)", () => {
-    expect(checkAuth(basic("bazel", ""), "")).toBe(false);
+  it("rejects when the user or secret is unset (fail closed)", () => {
+    expect(checkAuth(basic(user, secret), "", secret)).toBe(false);
+    expect(checkAuth(basic(user, ""), user, "")).toBe(false);
   });
 
   it("rejects a credential with no colon separator", () => {
-    expect(checkAuth("Basic " + btoa("nocolon"), secret)).toBe(false);
+    expect(checkAuth("Basic " + btoa("nocolon"), user, secret)).toBe(false);
   });
 });

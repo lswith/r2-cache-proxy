@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createLogger, withRequestContext } from "../src/logger";
 
-const svc = "bazel-mirror-test";
+const svc = "r2-cache-proxy-test";
 
 function captureConsole(fn: () => void): {
   log: string[];

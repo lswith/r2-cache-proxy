@@ -1,22 +1,26 @@
-// Transparent, lazy read-through mirror for Bazel external dependencies.
+// Transparent, lazy read-through mirror for any URL-addressed artifact.
 //
 // The request path IS the upstream URL minus scheme. On a hit the object is
 // served straight from R2; on a miss the worker fetches it from the real
-// upstream, stores it in R2, and serves it — so the first build to ask for an
-// artifact populates the cache and every later build gets it from R2. This
-// keeps hermetic Bazel builds resilient to upstream URL rot/outages.
+// upstream, stores it in R2, and serves it — so the first caller to ask for
+// an artifact populates the cache and every later caller gets it from R2.
+// This keeps builds/installs resilient to upstream URL rot and outages,
+// whatever's downloading — Bazel, npm, pip, a Dockerfile, or a plain script.
 //
-// Every request must present a shared secret via HTTP Basic auth (Bazel
-// supplies it from ~/.netrc). Without a valid token the worker returns 401
-// before doing any R2 or upstream work — so there's no open-proxy surface.
+// Every request must present a shared username + secret via HTTP Basic auth.
+// Without valid credentials the worker returns 401 before doing any R2 or
+// upstream work — so there's no open-proxy surface.
 //
-// See README.md for the Bazel-side wiring (downloader config + netrc).
+// See README.md for example client wiring (Bazel's downloader config, netrc,
+// or a bare curl/wget invocation).
 
 import { createLogger, withRequestContext } from "./logger";
 
-const log = createLogger("bazel-mirror");
+const log = createLogger("r2-cache-proxy");
 
 interface Env {
+  // env var (wrangler.jsonc `vars`, or dashboard Settings → Variables)
+  MIRROR_USER: string;
   // secret (via `wrangler secret put`)
   MIRROR_SECRET: string;
   // binding (wrangler.jsonc)
@@ -41,12 +45,12 @@ function safeEqual(a: string, b: string): boolean {
 
 /**
  * Validate an `Authorization: Basic <base64(user:pass)>` header against the
- * shared secret. The username is ignored (Bazel's netrc `login` can be
- * anything); only the password must equal MIRROR_SECRET. Returns false for a
- * missing/malformed header or an unset secret (fail closed).
+ * configured credentials. Both the username (MIRROR_USER) and the password
+ * (MIRROR_SECRET) must match. Returns false for a missing/malformed header or
+ * an unset user/secret (fail closed).
  */
-export function checkAuth(header: string | null, secret: string): boolean {
-  if (!secret) return false;
+export function checkAuth(header: string | null, user: string, secret: string): boolean {
+  if (!user || !secret) return false;
   if (!header?.startsWith("Basic ")) return false;
   let decoded: string;
   try {
@@ -56,14 +60,14 @@ export function checkAuth(header: string | null, secret: string): boolean {
   }
   const sep = decoded.indexOf(":");
   if (sep === -1) return false;
-  return safeEqual(decoded.slice(sep + 1), secret);
+  return safeEqual(decoded.slice(0, sep), user) && safeEqual(decoded.slice(sep + 1), secret);
 }
 
 /**
  * Map an incoming request URL to an R2 key + the upstream URL to fetch on a
  * miss. The path is the upstream URL minus scheme:
- *   `/github.com/o/r/x.tar.gz` → key `github.com/o/r/x.tar.gz`,
- *                                 upstream `https://github.com/o/r/x.tar.gz`.
+ *   `/github.com/o/r/v1.tar.gz` → key `github.com/o/r/v1.tar.gz`,
+ *                                 upstream `https://github.com/o/r/v1.tar.gz`.
  * Any query string is kept verbatim in both (distinct queries → distinct cache
  * entries). Returns null for an empty/traversal path or one with no host.
  */
@@ -79,10 +83,12 @@ export function deriveKey(url: URL): { key: string; upstream: string } | null {
   return { key: path + url.search, upstream: `https://${path}${url.search}` };
 }
 
-// Build artifacts are immutable (Bazel re-verifies every download against the
-// sha256 in the build files), so edge entries can live for a year. Refreshing
-// an object therefore needs BOTH an R2 delete and a zone-level purge of the
-// URL — see README "Refreshing a cached object".
+// Mirrored artifacts are treated as immutable — most callers re-verify what
+// they download against a checksum of their own anyway (Bazel's sha256, npm's
+// integrity hash, a Docker layer digest), so a stale byte just fails that
+// check rather than silently corrupting anything. Edge entries can therefore
+// live for a year. Refreshing an object needs BOTH an R2 delete and a
+// zone-level purge of the URL — see README "Refreshing a cached object".
 const EDGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 /**
@@ -288,10 +294,10 @@ export default {
     const url = new URL(request.url);
     return withRequestContext({ requestId: crypto.randomUUID(), route: url.pathname }, async () => {
       // 1. Auth first — before any R2 or upstream work.
-      if (!checkAuth(request.headers.get("authorization"), env.MIRROR_SECRET)) {
+      if (!checkAuth(request.headers.get("authorization"), env.MIRROR_USER, env.MIRROR_SECRET)) {
         return new Response("Unauthorized\n", {
           status: 401,
-          headers: { "www-authenticate": 'Basic realm="bazel-mirror"' },
+          headers: { "www-authenticate": 'Basic realm="r2-cache-proxy"' },
         });
       }
 
@@ -374,7 +380,7 @@ export default {
       // upstream body lacks — storeToR2 accumulates fixed-size parts (single
       // put() for small bodies, multipart for large) to supply one. Concurrent
       // misses for the same key both store (last write wins, identical bytes) —
-      // fine for immutable build artifacts.
+      // fine for immutable artifacts.
       try {
         await storeToR2(env.MIRROR, key, upstreamResp.body, {
           contentType: upstreamResp.headers.get("content-type") ?? "application/octet-stream",

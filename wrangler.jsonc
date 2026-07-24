@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "mirror",
+  "name": "r2-cache-proxy",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-16",
   "compatibility_flags": ["nodejs_compat"],
@@ -15,16 +15,24 @@
     "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1 }
   },
   "upload_source_maps": true,
-  // Custom domain. Cloudflare auto-manages the A/AAAA records on the lswith.io
-  // zone on first deploy.
-  "routes": [{ "pattern": "bazel-mirror.lswith.io", "custom_domain": true }],
-  "workers_dev": false,
-  "preview_urls": false,
-  // Lazy read-through cache of Bazel external deps. Objects are keyed by the
-  // upstream URL minus scheme (e.g. `github.com/org/repo/archive/v1.tar.gz`).
-  "r2_buckets": [{ "binding": "MIRROR", "bucket_name": "lswith-bazel-mirror" }]
-  // Secret (set via `wrangler secret put`): MIRROR_SECRET — the shared token
-  // every request must present via HTTP Basic auth (Bazel supplies it from
-  // ~/.netrc). Without a valid token the worker returns 401 before doing any
-  // R2 or upstream work.
+  // No routes/custom domain here — this deploys to your account's
+  // *.workers.dev subdomain out of the box (works with the Deploy to
+  // Cloudflare button, which can't know a domain you don't yet own). Add a
+  // `routes` entry, or attach a custom domain from the dashboard, once you're
+  // ready to put this behind your own hostname.
+  //
+  // Lazy read-through cache of any URL-addressed artifact. Objects are keyed
+  // by the upstream URL minus scheme (e.g. `github.com/org/repo/v1.tar.gz`).
+  "r2_buckets": [{ "binding": "MIRROR", "bucket_name": "r2-cache-proxy" }],
+  // Basic-auth username. Not secret (it's committed here and visible to
+  // anyone who can read this repo/deploy) — the real credential is
+  // MIRROR_SECRET below. Change it here, or override it after deploy from
+  // the dashboard (Settings → Variables and Secrets).
+  "vars": { "MIRROR_USER": "mirror" },
+  // Required secret (set via `wrangler secret put MIRROR_SECRET`, or the
+  // Deploy to Cloudflare button will prompt for it): the Basic-auth password
+  // every request must present alongside MIRROR_USER. `wrangler deploy` fails
+  // fast if it's missing. Without valid credentials the worker returns 401
+  // before doing any R2 or upstream work.
+  "secrets": { "required": ["MIRROR_SECRET"] }
 }

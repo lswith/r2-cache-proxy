@@ -8,15 +8,17 @@ import { storeToEdgeCache, storeToR2 } from "../src/index";
 declare module "cloudflare:test" {
   interface ProvidedEnv {
     MIRROR: R2Bucket;
+    MIRROR_USER: string;
     MIRROR_SECRET: string;
   }
 }
 
-const WORKER = "https://bazel-mirror.lswith.io";
+const WORKER = "https://mirror.example.com";
+const USER = "test_user"; // matches vitest.config.ts miniflare binding
 const SECRET = "test_secret"; // matches vitest.config.ts miniflare binding
 
-function auth(secret = SECRET): string {
-  return "Basic " + btoa(`bazel:${secret}`);
+function auth(user = USER, secret = SECRET): string {
+  return "Basic " + btoa(`${user}:${secret}`);
 }
 
 // --- Outbound upstream fetch mock -------------------------------------------
@@ -89,7 +91,15 @@ describe("auth", () => {
 
   it("401s a request with the wrong secret", async () => {
     const res = await SELF.fetch(`${WORKER}/github.com/o/r/archive/v1.tar.gz`, {
-      headers: { authorization: auth("wrong") },
+      headers: { authorization: auth(USER, "wrong") },
+    });
+    expect(res.status).toBe(401);
+    expect(upstreamRequests).toHaveLength(0);
+  });
+
+  it("401s a request with the wrong username", async () => {
+    const res = await SELF.fetch(`${WORKER}/github.com/o/r/archive/v1.tar.gz`, {
+      headers: { authorization: auth("someone-else", SECRET) },
     });
     expect(res.status).toBe(401);
     expect(upstreamRequests).toHaveLength(0);
@@ -103,12 +113,12 @@ describe("auth", () => {
     expect(upstreamRequests).toHaveLength(0);
   });
 
-  it("accepts any username, only the password (secret) matters", async () => {
+  it("accepts the correct username and password", async () => {
     // Key is unique to this test: the 200 schedules a waitUntil edge-cache put
     // that may land after the next test's beforeEach purge (see above).
     await env.MIRROR.put("github.com/o/r/auth-check.tar.gz", "CACHED");
     const res = await SELF.fetch(`${WORKER}/github.com/o/r/auth-check.tar.gz`, {
-      headers: { authorization: "Basic " + btoa(`anyone:${SECRET}`) },
+      headers: { authorization: auth() },
     });
     expect(res.status).toBe(200);
   });

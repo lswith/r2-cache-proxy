@@ -3,7 +3,8 @@ import { defineConfig } from "vitest/config";
 
 // Tests run inside workerd (the real Worker runtime) with a real (local) R2
 // bucket for MIRROR, so miss→populate→hit is exercised through the same code
-// path as production. MIRROR_SECRET is supplied here; all other config comes
+// path as production. MIRROR_USER/MIRROR_SECRET are supplied here (overriding
+// wrangler.jsonc's committed MIRROR_USER default); all other config comes
 // from wrangler.jsonc. Outbound upstream fetches are intercepted via
 // vi.spyOn(globalThis, "fetch") in the test file — no real network calls.
 export default defineConfig({
@@ -12,6 +13,7 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         bindings: {
+          MIRROR_USER: "test_user",
           MIRROR_SECRET: "test_secret",
         },
         // Real local R2 bucket so tests assert persisted objects directly.

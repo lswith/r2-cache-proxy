@@ -1,0 +1,8 @@
+# pnpm blocks dependency postinstall scripts by default; these are the ones
+# that genuinely need their install scripts (platform binaries). sharp is a
+# transitive dependency pulled in by tooling, not used directly — no install
+# script needed.
+allowBuilds:
+  esbuild: true
+  sharp: false
+  workerd: true
