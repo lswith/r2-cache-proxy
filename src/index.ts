@@ -141,22 +141,38 @@ function concat(chunks: Uint8Array[], length: number): Uint8Array {
 }
 
 /**
- * Read from `reader` until at least `partSize` bytes are accumulated or the
- * stream ends. `done` is true only when the stream is exhausted.
+ * Wrap a stream reader to yield fixed-size parts: every part is exactly
+ * `partSize` bytes except the last, which holds whatever remains when the
+ * stream ends. R2 requires all non-trailing multipart parts to be the *same*
+ * length — handing out a part sized to whatever a single `reader.read()`
+ * happened to deliver (as long as it's >= partSize) breaks that invariant the
+ * moment upstream chunk boundaries don't align to partSize, since the
+ * overshoot varies read to read. This carries any overshoot into `leftover`
+ * instead of handing it out, so every returned part lines up exactly.
  */
-async function readPart(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  partSize: number,
-): Promise<{ data: Uint8Array; done: boolean }> {
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  while (length < partSize) {
-    const { done, value } = await reader.read();
-    if (done) return { data: concat(chunks, length), done: true };
-    chunks.push(value);
-    length += value.byteLength;
-  }
-  return { data: concat(chunks, length), done: false };
+function createPartReader(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  let leftover = new Uint8Array(0);
+  let streamDone = false;
+  return async function readPart(partSize: number): Promise<{ data: Uint8Array; done: boolean }> {
+    const chunks: Uint8Array[] = leftover.byteLength > 0 ? [leftover] : [];
+    let length = leftover.byteLength;
+    leftover = new Uint8Array(0);
+    while (length < partSize && !streamDone) {
+      const { done, value } = await reader.read();
+      if (done) {
+        streamDone = true;
+        break;
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+    const data = concat(chunks, length);
+    if (length > partSize) {
+      leftover = data.subarray(partSize);
+      return { data: data.subarray(0, partSize), done: false };
+    }
+    return { data, done: streamDone };
+  };
 }
 
 /**
@@ -174,8 +190,8 @@ export async function storeToR2(
   httpMetadata: R2HTTPMetadata,
   partSize: number = PART_SIZE,
 ): Promise<void> {
-  const reader = body.getReader();
-  const first = await readPart(reader, partSize);
+  const readPart = createPartReader(body.getReader());
+  const first = await readPart(partSize);
   if (first.done) {
     // Whole body fit in one part — plain single-shot put.
     await bucket.put(key, first.data, { httpMetadata });
@@ -191,7 +207,7 @@ export async function storeToR2(
       parts.push(await mpu.uploadPart(partNumber, part.data));
       partNumber += 1;
       if (part.done) break;
-      part = await readPart(reader, partSize);
+      part = await readPart(partSize);
       // The stream can end exactly on a part boundary → a 0-byte trailing read.
       // Don't upload an empty part.
       if (part.done && part.data.byteLength === 0) break;

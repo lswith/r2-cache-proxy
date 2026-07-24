@@ -372,4 +372,82 @@ describe("storeToR2 (streaming into R2)", () => {
     const stored = await env.MIRROR.get("example.com/exact.bin");
     expect(stored!.size).toBe(10 * MiB);
   });
+
+  // A patterned body whose chunk sizes cycle through irregular values, like a
+  // real upstream fetch() body (TCP/network buffering delivers whatever-sized
+  // chunks it has on hand per read(), not neat fixed-size ones). A *uniform*
+  // chunk size can't reproduce the production bug: accumulating whole chunks
+  // until a part hits partSize always overshoots by the same fixed amount
+  // when every chunk is the same size, so parts stay equal-length even with
+  // the naive (buggy) accumulation. Irregular chunk sizes are what actually
+  // make the overshoot drift from part to part.
+  function patternedIrregular(
+    total: number,
+    chunkSizes: number[],
+  ): {
+    stream: ReadableStream<Uint8Array>;
+    bytes: Uint8Array;
+  } {
+    const bytes = new Uint8Array(total);
+    for (let i = 0; i < total; i++) bytes[i] = i % 251;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let off = 0;
+        let i = 0;
+        while (off < total) {
+          const size = Math.min(chunkSizes[i % chunkSizes.length], total - off);
+          controller.enqueue(bytes.subarray(off, off + size));
+          off += size;
+          i += 1;
+        }
+        controller.close();
+      },
+    });
+    return { stream, bytes };
+  }
+
+  it("uploads uniform-length parts when upstream chunk boundaries don't align to partSize", async () => {
+    // 11 MiB delivered in irregular chunk sizes against 5 MiB parts. Without
+    // trimming overshoot into a carried-over leftover, this reproduces R2's
+    // real "All non-trailing parts must have the same length" rejection.
+    const { stream, bytes } = patternedIrregular(11 * MiB, [700_000, 350_000, 900_000, 123_456]);
+
+    const partLengths: number[] = [];
+    const createSpy = vi
+      .spyOn(env.MIRROR, "createMultipartUpload")
+      .mockImplementation(async (key, opts) => {
+        createSpy.mockRestore();
+        const mpu = await env.MIRROR.createMultipartUpload(key, opts);
+        const originalUploadPart = mpu.uploadPart.bind(mpu);
+        mpu.uploadPart = async (partNumber: number, value: R2UploadPartValue) => {
+          partLengths.push((value as Uint8Array).byteLength);
+          return originalUploadPart(partNumber, value);
+        };
+        return mpu;
+      });
+
+    await storeToR2(
+      env.MIRROR,
+      "example.com/irregular.bin",
+      stream,
+      { contentType: "application/gzip" },
+      5 * MiB,
+    );
+
+    expect(partLengths.length).toBeGreaterThan(1);
+    const nonTrailing = partLengths.slice(0, -1);
+    expect(new Set(nonTrailing)).toEqual(new Set([5 * MiB]));
+
+    const stored = await env.MIRROR.get("example.com/irregular.bin");
+    expect(stored!.size).toBe(11 * MiB);
+    const got = new Uint8Array(await stored!.arrayBuffer());
+    let firstMismatch = -1;
+    for (let i = 0; i < bytes.length; i++) {
+      if (got[i] !== bytes[i]) {
+        firstMismatch = i;
+        break;
+      }
+    }
+    expect(firstMismatch).toBe(-1);
+  });
 });
