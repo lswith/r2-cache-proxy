@@ -5,10 +5,11 @@
  *
  * Fetches a small, stable public file through the mirror twice and asserts both
  * requests return 200 with identical bytes and that the second is served from
- * R2 (`x-mirror-status: hit`). On a truly cold key the first request is a
- * `miss-stored` (the worker fetches upstream + stores it); on repeat runs it's
- * already a hit — either is fine, the invariant is "second request hits R2 and
- * the bytes match".
+ * the mirror's cache (`x-mirror-status: hit` from R2, or `hit-edge` from the
+ * PoP's edge cache). On a truly cold key the first request is a `miss-stored`
+ * (the worker fetches upstream + stores it); on repeat runs it's already a
+ * hit — either is fine, the invariant is "second request is served from cache
+ * and the bytes match".
  *
  * Usage (MIRROR_SECRET comes from your shell env — see ~/.secrets.zsh):
  *   node scripts/smoke.mjs
@@ -46,16 +47,16 @@ console.log(`Smoke: ${url}\n`);
 console.log("== 1. first request (cold miss populates, or already cached) ==");
 const first = await get("first ");
 
-console.log("== 2. second request (expect R2 hit) ==");
+console.log("== 2. second request (expect cache hit: hit or hit-edge) ==");
 const second = await get("second");
 
 if (!first.body.equals(second.body)) {
   console.error("\nFAIL: first and second responses have different bytes.");
   process.exit(1);
 }
-if (second.status !== "hit") {
-  console.error(`\nFAIL: expected second request to be a hit, got '${second.status}'.`);
+if (second.status !== "hit" && second.status !== "hit-edge") {
+  console.error(`\nFAIL: expected second request to be a hit or hit-edge, got '${second.status}'.`);
   process.exit(1);
 }
 
-console.log("\nOK: mirror serves identical bytes and the warm request hit R2.");
+console.log("\nOK: mirror serves identical bytes and the warm request was served from cache.");

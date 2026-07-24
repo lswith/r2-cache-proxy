@@ -7,6 +7,15 @@ the real upstream, stores it in R2, and serves it — so the first build to ask
 for an artifact populates the cache and every later build gets it from R2. This
 keeps hermetic Bazel builds resilient to upstream URL rot and outages.
 
+On top of R2 sits Cloudflare's **per-PoP edge cache**: every full-object 200 up
+to 64 MiB is also written to `caches.default`, so repeat fetches are served
+from the PoP nearest the requester (~tens of ms) instead of paying the
+cross-region worker → R2 round trip on every hit. R2 stays the durable source
+of truth; the edge cache is a latency shortcut that any PoP can rebuild from R2
+at any time, and larger objects simply keep streaming from R2 (the Cache API
+caps entries at 512 MB, and tee-ing a huge body into the cache would buffer it
+in worker memory — see `EDGE_CACHE_MAX_SIZE`).
+
 Deployed at `https://bazel-mirror.lswith.io`. Every request must present a
 shared secret via HTTP Basic auth (Bazel supplies it from `~/.netrc`); without
 a valid token the worker returns `401` before doing any R2 or upstream work, so
@@ -19,17 +28,27 @@ there is no open-proxy surface.
 | `GET` / `HEAD` | `/<host>/<path>` | Hit: serve `<host>/<path>` from R2. Miss: fetch `https://<host>/<path>`, store it, serve it. |
 
 - Auth: `Authorization: Basic base64(<anything>:<MIRROR_SECRET>)` on every
-  request. Missing/wrong → `401`. Any method other than `GET`/`HEAD` → `405`.
-- `Range` and `If-None-Match` are honored (206 / 304) once an object is cached.
-- Response header `x-mirror-status` reports what happened: `hit`,
-  `miss-stored`, `miss-passthrough` (upstream returned non-2xx — passed through,
-  **not** cached), or `miss-error` (upstream fetch threw → `502`).
+  request. Missing/wrong → `401`, checked **before** any edge-cache or R2
+  lookup — a cached object is never served unauthenticated. Any method other
+  than `GET`/`HEAD` → `405`.
+- `Range` and `If-None-Match` are honored (206 / 304) once an object is cached,
+  from both the edge cache and R2.
+- Response header `x-mirror-status` reports what happened: `hit-edge` (served
+  from this PoP's edge cache, no R2 read), `hit` (served from R2), `miss-stored`,
+  `miss-passthrough` (upstream returned non-2xx — passed through, **not**
+  cached), or `miss-error` (upstream fetch threw → `502`).
+- Edge-cache population is GET-only, full-200-only, and capped at 64 MiB (a
+  ranged 206 or a 304 is never stored, so a partial object can't poison the
+  cache; HEAD bypasses the edge cache; bigger objects always stream from R2).
+  Entries carry `cache-control: public, max-age=31536000,
+immutable` — safe because Bazel re-verifies every download against its
+  `sha256`.
 
 ## Layout
 
 ```
 worker-bazel-mirror/
-  src/index.ts       — auth, key derivation, hit/miss handling, R2 serve
+  src/index.ts       — auth, key derivation, edge-cache + R2 hit/miss handling
   src/logger.ts      — shared NDJSON logger (copied verbatim across workers)
   test/mirror.test.ts  — workerd + real local R2: auth, hit, miss, range, passthrough
   test/helpers.test.ts — unit tests for deriveKey / checkAuth
@@ -109,7 +128,8 @@ Notes / gotchas:
 cp .dev.vars.example .dev.vars   # set MIRROR_SECRET
 pnpm run dev                     # wrangler dev — local R2, http://localhost:8787
 
-# cold miss then warm hit (same bytes, second is served from R2):
+# cold miss then warm hit (same bytes, second is x-mirror-status: hit-edge —
+# miniflare implements caches.default too — or hit if served from R2):
 curl -u bazel:$MIRROR_SECRET http://localhost:8787/raw.githubusercontent.com/bazelbuild/bazel/master/.bazelversion -i
 curl  # no creds → 401
 ```
@@ -162,14 +182,20 @@ APM needed.
   Bazel deps are https in practice; http upstreams aren't mirror-able.
 - **Concurrent misses** for the same key both fetch and `put` (last write wins,
   identical bytes) — fine for immutable build artifacts.
-- **Size ceiling (~128 MB).** On a miss the worker buffers the object in memory
-  before storing it — R2 `put()` needs a known length, which an
-  auto-decompressed or chunked upstream body doesn't have. So a single artifact
-  is bounded by the 128 MB worker memory limit. Bazel deps are almost always
-  well under this; mirroring artifacts larger than that would need multipart
-  streaming (not yet implemented).
-- **Refreshing a cached object** (e.g. an upstream re-tagged a release): delete
-  the key from the bucket and the next request re-fetches it —
-  `pnpm exec wrangler r2 object delete lswith-bazel-mirror/<host>/<path>`.
+- **Size ceiling: the platform's, not the worker's memory.** On a miss the
+  body streams into R2 in fixed 10 MiB parts (single `put()` for small
+  objects, multipart upload for large ones — see `storeToR2`), holding ~one
+  part in memory at a time. The binding ceiling is therefore the per-invocation
+  subrequest cap (~1,000 calls × 10 MiB parts ≈ 10 GB per artifact), not the
+  128 MB worker memory limit. Far beyond any real Bazel dep.
+- **Refreshing a cached object** (e.g. an upstream re-tagged a release) takes
+  two steps now that the edge cache exists:
+  1. Delete the key from R2 —
+     `pnpm exec wrangler r2 object delete lswith-bazel-mirror/<host>/<path>`.
+  2. Purge the URL from the zone's edge cache (dashboard → lswith.io → Caching
+     → Purge by URL, or the API) with
+     `https://bazel-mirror.lswith.io/<host>/<path>` — edge entries are stored
+     with a 1-year TTL, so without the purge, PoPs that already hold the object
+     keep serving the old bytes.
 - **Non-2xx is never cached**, so a transient upstream 5xx or a 404 won't poison
   the cache; the next request retries the upstream.

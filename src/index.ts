@@ -79,6 +79,12 @@ export function deriveKey(url: URL): { key: string; upstream: string } | null {
   return { key: path + url.search, upstream: `https://${path}${url.search}` };
 }
 
+// Build artifacts are immutable (Bazel re-verifies every download against the
+// sha256 in the build files), so edge entries can live for a year. Refreshing
+// an object therefore needs BOTH an R2 delete and a zone-level purge of the
+// URL — see README "Refreshing a cached object".
+const EDGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
 /**
  * Build the HTTP response for an R2 object (a cache hit or a freshly-stored
  * miss), honoring Range (206) and conditional (304) semantics that R2 resolved
@@ -93,6 +99,7 @@ function serveObject(
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
   headers.set("accept-ranges", "bytes");
+  headers.set("cache-control", EDGE_CACHE_CONTROL);
   headers.set("x-mirror-status", mirrorStatus);
 
   const body = "body" in object ? object.body : null;
@@ -122,6 +129,59 @@ function serveObject(
 
   headers.set("content-length", String(object.size));
   return new Response(isHead ? null : body, { status: 200, headers });
+}
+
+/**
+ * Serve an edge-cache match, rewrapping only to restamp x-mirror-status so the
+ * response advertises where it came from. cache.match has already resolved
+ * Range (206) and If-None-Match (304) against the stored 200.
+ */
+function serveEdgeMatch(cached: Response): Response {
+  const headers = new Headers(cached.headers);
+  headers.set("x-mirror-status", "hit-edge");
+  return new Response(cached.body, { status: cached.status, headers });
+}
+
+// Objects above this size are never edge-cached and always stream from R2.
+// Two hard reasons: the Cache API caps entries at 512 MB, and — worse — tee()
+// buffers the divergence between the cache write and the client download in
+// isolate memory, so a stalled client with a fast cache ingest buffers up to
+// the whole object and can blow the 128 MB worker memory limit (the exact
+// large-artifact case storeToR2's multipart streaming exists to handle). Large
+// artifacts amortize the R2 round trip over their transfer time anyway; the
+// edge cache is for the many small fetches where TTFB dominates.
+const EDGE_CACHE_MAX_SIZE = 64 * 1024 * 1024;
+
+/**
+ * Tee a full-object 200 into the per-PoP edge cache so repeat fetches never
+ * touch R2 (the put runs via ctx.waitUntil and doesn't delay the response).
+ * Only a plain 200 GET at or under maxSize is storable — the Cache API rejects
+ * a 206, a 304 has no body, and oversized objects must not be teed (see
+ * EDGE_CACHE_MAX_SIZE) — but ranged/conditional requests still edge-serve
+ * later because cache.match slices/revalidates against the stored 200. The
+ * entry is keyed on `edgeUrl`, the canonical URL rebuilt from the derived R2
+ * key, so a non-canonical request spelling (doubled slash, etc.) can't create
+ * a duplicate entry the documented purge flow would miss. Auth is enforced in
+ * the handler before any cache lookup. A failed put only logs — the response
+ * has already been served. `maxSize` is injectable for tests.
+ */
+export function storeToEdgeCache(
+  response: Response,
+  request: Request,
+  edgeUrl: string,
+  ctx: ExecutionContext,
+  maxSize: number = EDGE_CACHE_MAX_SIZE,
+): Response {
+  if (request.method !== "GET" || response.status !== 200 || !response.body) return response;
+  const length = response.headers.get("content-length");
+  if (length === null || Number(length) > maxSize) return response;
+  const [clientBody, cacheBody] = response.body.tee();
+  ctx.waitUntil(
+    caches.default
+      .put(edgeUrl, new Response(cacheBody, { status: 200, headers: response.headers }))
+      .catch((err) => log.warn("edge cache put failed", { url: edgeUrl, error: String(err) })),
+  );
+  return new Response(clientBody, { status: 200, headers: response.headers });
 }
 
 // R2 requires every multipart part except the last to be >= 5 MiB. Use 10 MiB
@@ -224,7 +284,7 @@ export async function storeToR2(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     return withRequestContext({ requestId: crypto.randomUUID(), route: url.pathname }, async () => {
       // 1. Auth first — before any R2 or upstream work.
@@ -248,14 +308,39 @@ export default {
       if (!target) return new Response("Not Found\n", { status: 404 });
       const { key, upstream } = target;
 
-      // 4. Hit? R2 resolves Range/conditional directly from the request headers.
+      // 4. Edge cache: repeat GETs for this PoP are served from local cache
+      //    without the cross-region R2 round trip. Keyed on the canonical URL
+      //    rebuilt from the derived key (not the raw request URL), carrying the
+      //    client's headers so match() resolves Range / If-None-Match against
+      //    the stored 200 — 206/304 come back ready. Auth (step 1) has already
+      //    run — a cached object is never served to an unauthenticated caller.
+      //    HEAD skips the edge cache and reads R2. The cache is a latency
+      //    shortcut only: if it throws, fall through to R2 rather than failing
+      //    a request R2 could serve.
+      const edgeUrl = `${url.origin}/${key}`;
+      if (request.method === "GET") {
+        try {
+          const cached = await caches.default.match(
+            new Request(edgeUrl, { headers: request.headers }),
+          );
+          if (cached) return serveEdgeMatch(cached);
+        } catch (err) {
+          log.warn("edge cache match failed, falling through to R2", {
+            url: edgeUrl,
+            error: String(err),
+          });
+        }
+      }
+
+      // 5. R2 hit? R2 resolves Range/conditional directly from the request headers.
       const existing = await env.MIRROR.get(key, {
         range: request.headers,
         onlyIf: request.headers,
       });
-      if (existing !== null) return serveObject(existing, request, "hit");
+      if (existing !== null)
+        return storeToEdgeCache(serveObject(existing, request, "hit"), request, edgeUrl, ctx);
 
-      // 5. Miss → fetch upstream. A fresh fetch with no init sends only default
+      // 6. Miss → fetch upstream. A fresh fetch with no init sends only default
       // headers, so the client's Authorization is never forwarded upstream. We
       // always fetch the FULL object (no Range forwarded) and slice locally.
       let upstreamResp: Response;
@@ -282,8 +367,9 @@ export default {
         });
       }
 
-      // 6. Store-then-serve, streaming the body into R2 in bounded-size parts so
-      // object size is limited by R2 (up to 5 TB), not the 128 MB worker memory.
+      // 7. Store-then-serve, streaming the body into R2 in bounded-size parts so
+      // object size is bounded by R2's multipart limits and the per-invocation
+      // subrequest cap (~10 GB practical), not the 128 MB worker memory.
       // R2 needs a known length per write, which an auto-decompressed or chunked
       // upstream body lacks — storeToR2 accumulates fixed-size parts (single
       // put() for small bodies, multipart for large) to supply one. Concurrent
@@ -307,7 +393,7 @@ export default {
         log.error("object missing immediately after put", { key });
         return new Response("Internal Error\n", { status: 500 });
       }
-      return serveObject(stored, request, "miss-stored");
+      return storeToEdgeCache(serveObject(stored, request, "miss-stored"), request, edgeUrl, ctx);
     });
   },
 } satisfies ExportedHandler<Env>;

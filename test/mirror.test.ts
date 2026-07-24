@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { storeToR2 } from "../src/index";
+import { storeToEdgeCache, storeToR2 } from "../src/index";
 
 // Type the bindings the test touches directly. (In production these come from
 // the wrangler-generated worker-configuration.d.ts; declaring them here keeps
@@ -43,9 +43,18 @@ function queueUpstream(origin: string, method: string, path: string, handler: Mo
 beforeEach(async () => {
   mockQueue = [];
   upstreamRequests = [];
-  // The local R2 bucket persists across tests in this file — clear it so each
-  // test starts from an empty cache and keys can be reused freely.
+  // The local R2 bucket AND the edge cache persist across tests in this file —
+  // clear both so each test starts cold. Edge entries are purged via the R2 key
+  // list (every edge-cached object was stored in R2 first). Two caveats: a test
+  // that deletes an R2 key mid-test must purge the matching edge URL itself
+  // (try/finally, so a failed assertion can't strand it for the retry), and a
+  // test that populates the edge cache should use a key unique to that test —
+  // the put runs via ctx.waitUntil, so it can land AFTER this purge has already
+  // run for the next test, stranding an entry that would poison a key-reuser.
   const listed = await env.MIRROR.list();
+  for (const o of listed.objects) {
+    await caches.default.delete(`${WORKER}/${o.key}`);
+  }
   if (listed.objects.length > 0) {
     await env.MIRROR.delete(listed.objects.map((o) => o.key));
   }
@@ -95,8 +104,10 @@ describe("auth", () => {
   });
 
   it("accepts any username, only the password (secret) matters", async () => {
-    await env.MIRROR.put("github.com/o/r/x.tar.gz", "CACHED");
-    const res = await SELF.fetch(`${WORKER}/github.com/o/r/x.tar.gz`, {
+    // Key is unique to this test: the 200 schedules a waitUntil edge-cache put
+    // that may land after the next test's beforeEach purge (see above).
+    await env.MIRROR.put("github.com/o/r/auth-check.tar.gz", "CACHED");
+    const res = await SELF.fetch(`${WORKER}/github.com/o/r/auth-check.tar.gz`, {
       headers: { authorization: "Basic " + btoa(`anyone:${SECRET}`) },
     });
     expect(res.status).toBe(200);
@@ -282,6 +293,245 @@ describe("cache hit", () => {
 
     expect(res.status).toBe(304);
     expect(await res.text()).toBe("");
+  });
+});
+
+describe("edge cache", () => {
+  // The worker populates the per-PoP edge cache via ctx.waitUntil, which
+  // finishes after the response is returned — poll until the entry lands.
+  async function expectEdgeCached(url: string): Promise<void> {
+    await vi.waitFor(async () => {
+      expect(await caches.default.match(url)).toBeDefined();
+    });
+  }
+
+  it("an R2 hit populates the edge cache and repeat GETs serve from the edge", async () => {
+    await env.MIRROR.put("example.com/edge/hit.bin", "EDGE-BYTES", {
+      httpMetadata: { contentType: "application/gzip" },
+    });
+    const url = `${WORKER}/example.com/edge/hit.bin`;
+
+    try {
+      const first = await SELF.fetch(url, { headers: { authorization: auth() } });
+      expect(first.status).toBe(200);
+      expect(first.headers.get("x-mirror-status")).toBe("hit");
+      expect(first.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      expect(await first.text()).toBe("EDGE-BYTES");
+      await expectEdgeCached(url);
+
+      // Remove the object from R2: the only way the next GET can succeed is the
+      // edge cache (an R2 miss would try upstream, and the empty mock queue
+      // throws → 502 miss-error).
+      await env.MIRROR.delete("example.com/edge/hit.bin");
+      const second = await SELF.fetch(url, { headers: { authorization: auth() } });
+      expect(second.status).toBe(200);
+      expect(second.headers.get("x-mirror-status")).toBe("hit-edge");
+      expect(second.headers.get("content-type")).toBe("application/gzip");
+      expect(await second.text()).toBe("EDGE-BYTES");
+      expect(upstreamRequests).toHaveLength(0);
+    } finally {
+      // Key was deleted from R2 mid-test, so beforeEach's R2-derived purge
+      // won't see it — purge here even on assertion failure, or the stranded
+      // entry would make every retry fail on the FIRST request's status.
+      await caches.default.delete(url);
+    }
+  });
+
+  it("a miss-stored response populates the edge cache too", async () => {
+    queueUpstream("https://example.com", "GET", "/edge/fresh.bin", () => new Response("FRESH"));
+    const url = `${WORKER}/example.com/edge/fresh.bin`;
+
+    const first = await SELF.fetch(url, { headers: { authorization: auth() } });
+    expect(first.headers.get("x-mirror-status")).toBe("miss-stored");
+    // The cold-miss path is what sets the edge TTL — pin the header here too.
+    expect(first.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(await first.text()).toBe("FRESH");
+    await expectEdgeCached(url);
+
+    const second = await SELF.fetch(url, { headers: { authorization: auth() } });
+    expect(second.headers.get("x-mirror-status")).toBe("hit-edge");
+    expect(await second.text()).toBe("FRESH");
+    expect(upstreamRequests).toHaveLength(1);
+  });
+
+  it("honors Range and If-None-Match against an edge-cached object", async () => {
+    await env.MIRROR.put("example.com/edge/blob", "0123456789");
+    const url = `${WORKER}/example.com/edge/blob`;
+
+    const full = await SELF.fetch(url, { headers: { authorization: auth() } });
+    const etag = full.headers.get("etag");
+    expect(etag).not.toBeNull();
+    await full.text();
+    await expectEdgeCached(url);
+
+    const ranged = await SELF.fetch(url, {
+      headers: { authorization: auth(), range: "bytes=2-5" },
+    });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("x-mirror-status")).toBe("hit-edge");
+    expect(await ranged.text()).toBe("2345");
+    expect(ranged.headers.get("content-range")).toBe("bytes 2-5/10");
+
+    const conditional = await SELF.fetch(url, {
+      headers: { authorization: auth(), "if-none-match": etag as string },
+    });
+    expect(conditional.status).toBe(304);
+    expect(conditional.headers.get("x-mirror-status")).toBe("hit-edge");
+  });
+
+  it("still 401s an unauthenticated request for an edge-cached object", async () => {
+    await env.MIRROR.put("example.com/edge/secret.bin", "SECRET-BYTES");
+    const url = `${WORKER}/example.com/edge/secret.bin`;
+
+    const first = await SELF.fetch(url, { headers: { authorization: auth() } });
+    await first.text();
+    await expectEdgeCached(url);
+
+    const res = await SELF.fetch(url);
+    expect(res.status).toBe(401);
+    expect(await res.text()).not.toContain("SECRET-BYTES");
+  });
+
+  it("HEAD bypasses the edge cache and serves from R2", async () => {
+    await env.MIRROR.put("example.com/edge/head.bin", "HEAD-BYTES");
+    const url = `${WORKER}/example.com/edge/head.bin`;
+
+    const populate = await SELF.fetch(url, { headers: { authorization: auth() } });
+    await populate.text();
+    await expectEdgeCached(url);
+
+    const head = await SELF.fetch(url, { method: "HEAD", headers: { authorization: auth() } });
+    expect(head.status).toBe(200);
+    expect(head.headers.get("x-mirror-status")).toBe("hit");
+    expect(head.headers.get("content-length")).toBe("10");
+    expect(await head.text()).toBe("");
+  });
+
+  it("query variants get distinct edge entries (no cross-poisoning)", async () => {
+    // deriveKey keeps the query string in both the R2 key and the URL, so two
+    // query variants are two separate objects — pin that the edge cache keys
+    // the same way and can never serve one variant's bytes for the other.
+    await env.MIRROR.put("example.com/edge/q?v=1", "VARIANT-ONE");
+    await env.MIRROR.put("example.com/edge/q?v=2", "VARIANT-TWO");
+    const url1 = `${WORKER}/example.com/edge/q?v=1`;
+    const url2 = `${WORKER}/example.com/edge/q?v=2`;
+
+    try {
+      const one = await SELF.fetch(url1, { headers: { authorization: auth() } });
+      expect(await one.text()).toBe("VARIANT-ONE");
+      const two = await SELF.fetch(url2, { headers: { authorization: auth() } });
+      expect(await two.text()).toBe("VARIANT-TWO");
+      await expectEdgeCached(url1);
+      await expectEdgeCached(url2);
+
+      // With the R2 objects gone, only the edge cache can answer.
+      await env.MIRROR.delete(["example.com/edge/q?v=1", "example.com/edge/q?v=2"]);
+      const oneAgain = await SELF.fetch(url1, { headers: { authorization: auth() } });
+      expect(oneAgain.headers.get("x-mirror-status")).toBe("hit-edge");
+      expect(await oneAgain.text()).toBe("VARIANT-ONE");
+      const twoAgain = await SELF.fetch(url2, { headers: { authorization: auth() } });
+      expect(twoAgain.headers.get("x-mirror-status")).toBe("hit-edge");
+      expect(await twoAgain.text()).toBe("VARIANT-TWO");
+    } finally {
+      // R2 keys were deleted mid-test — purge the edge entries ourselves.
+      await caches.default.delete(url1);
+      await caches.default.delete(url2);
+    }
+  });
+
+  it("a ranged 206 from R2 does NOT create an edge entry (no partial-object poisoning)", async () => {
+    await env.MIRROR.put("example.com/edge/partial", "0123456789");
+    const url = `${WORKER}/example.com/edge/partial`;
+
+    const ranged = await SELF.fetch(url, {
+      headers: { authorization: auth(), range: "bytes=0-3" },
+    });
+    expect(ranged.status).toBe(206);
+    expect(ranged.headers.get("x-mirror-status")).toBe("hit");
+    expect(await ranged.text()).toBe("0123");
+
+    // Give a (buggy) background put a chance to land, then assert absence.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await caches.default.match(url)).toBeUndefined();
+  });
+
+  it("serves from R2 when the edge-cache lookup throws (fail open)", async () => {
+    await env.MIRROR.put("example.com/edge/failopen.bin", "STILL-SERVED");
+    const url = `${WORKER}/example.com/edge/failopen.bin`;
+
+    vi.spyOn(caches.default, "match").mockRejectedValueOnce(new Error("cache exploded"));
+    const res = await SELF.fetch(url, { headers: { authorization: auth() } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-mirror-status")).toBe("hit");
+    expect(await res.text()).toBe("STILL-SERVED");
+  });
+
+  it("a failed edge-cache put does not affect the already-served response", async () => {
+    await env.MIRROR.put("example.com/edge/putfail.bin", "SERVED-ANYWAY");
+    const url = `${WORKER}/example.com/edge/putfail.bin`;
+
+    vi.spyOn(caches.default, "put").mockRejectedValueOnce(new Error("cache full"));
+    const res = await SELF.fetch(url, { headers: { authorization: auth() } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-mirror-status")).toBe("hit");
+    expect(await res.text()).toBe("SERVED-ANYWAY");
+  });
+
+  // Direct unit tests of the size cap: tee() buffers the divergence between
+  // the cache write and the client download in isolate memory, so oversized
+  // objects must skip edge caching entirely (they stream from R2 as before).
+  describe("size cap (storeToEdgeCache called directly)", () => {
+    function fakeCtx(puts: Promise<unknown>[]): ExecutionContext {
+      return {
+        waitUntil: (p: Promise<unknown>) => puts.push(p),
+        passThroughOnException: () => {},
+        props: {},
+      } as unknown as ExecutionContext;
+    }
+
+    function res200(body: string, extraHeaders: Record<string, string> = {}): Response {
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "content-length": String(body.length),
+          "cache-control": "public, max-age=60",
+          ...extraHeaders,
+        },
+      });
+    }
+
+    it("does not schedule a put for an object larger than the cap", async () => {
+      const puts: Promise<unknown>[] = [];
+      const url = "https://mirror.test/over-cap";
+      const out = storeToEdgeCache(res200("0123456789"), new Request(url), url, fakeCtx(puts), 9);
+      expect(puts).toHaveLength(0);
+      // The body passes through untouched (no tee).
+      expect(await out.text()).toBe("0123456789");
+      expect(await caches.default.match(url)).toBeUndefined();
+    });
+
+    it("does not schedule a put when content-length is missing (fail safe)", async () => {
+      const puts: Promise<unknown>[] = [];
+      const url = "https://mirror.test/no-length";
+      const headerless = new Response("0123456789", { status: 200 });
+      headerless.headers.delete("content-length");
+      const out = storeToEdgeCache(headerless, new Request(url), url, fakeCtx(puts), 1024);
+      expect(puts).toHaveLength(0);
+      expect(await out.text()).toBe("0123456789");
+    });
+
+    it("schedules a put for an object at the cap", async () => {
+      const puts: Promise<unknown>[] = [];
+      const url = "https://mirror.test/at-cap";
+      const out = storeToEdgeCache(res200("0123456789"), new Request(url), url, fakeCtx(puts), 10);
+      expect(await out.text()).toBe("0123456789");
+      expect(puts).toHaveLength(1);
+      await Promise.all(puts);
+      const cached = await caches.default.match(url);
+      expect(cached).toBeDefined();
+      expect(await cached?.text()).toBe("0123456789");
+      await caches.default.delete(url);
+    });
   });
 });
 
