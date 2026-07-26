@@ -32,6 +32,7 @@ Click the button above, or set it up by hand:
 pnpm install
 pnpm exec wrangler login                          # the account you want to deploy to
 pnpm exec wrangler r2 bucket create r2-cache-proxy # matches wrangler.jsonc's bucket_name
+echo mirror | pnpm exec wrangler secret put MIRROR_USER    # pick any username
 openssl rand -hex 32 | pnpm exec wrangler secret put MIRROR_SECRET
 pnpm run deploy                                    # wrangler deploy
 ```
@@ -40,7 +41,17 @@ That deploys to your account's `*.workers.dev` subdomain. Attach a custom
 domain afterwards from the dashboard (Worker → Settings → Domains & Routes) if
 you want one.
 
-Keep a copy of the generated `MIRROR_SECRET` — every client needs it (below).
+Keep a copy of both — every client needs them (below).
+
+**Both must be set as secrets, not dashboard "Variables".** `MIRROR_USER` and
+`MIRROR_SECRET` are declared under `secrets.required` in `wrangler.jsonc`, not
+`vars` — that's deliberate. A plain `vars` entry is re-applied from the
+committed config on every deploy (including Workers Builds' auto-deploy on
+push), which would silently overwrite anything you set for it in the
+dashboard. If auth stops matching what you think you configured, check
+Worker → Settings → Variables and Secrets and make sure both are listed under
+**Secrets**, set via `wrangler secret put` (or the Deploy to Cloudflare
+button's prompts) — not under Variables.
 
 ## Endpoints
 
@@ -82,7 +93,7 @@ r2-cache-proxy/
 | Name            | Where it lives                     | Purpose                                                            |
 | --------------- | ----------------------------------- | ------------------------------------------------------------------ |
 | `MIRROR`        | binding (`wrangler.jsonc`)         | R2 bucket the objects are stored in.                                |
-| `MIRROR_USER`   | var (`wrangler.jsonc` `vars`)      | Basic-auth username. Not secret — change the committed default or override it from the dashboard. |
+| `MIRROR_USER`   | **secret** (`wrangler secret put`) | Basic-auth username every request must present alongside `MIRROR_SECRET`. A secret, not a `vars` entry — see "Deploy" above for why. |
 | `MIRROR_SECRET` | **secret** (`wrangler secret put`) | Basic-auth password every request must present alongside `MIRROR_USER`. |
 
 ## Example: wiring a client

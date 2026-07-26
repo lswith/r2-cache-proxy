@@ -1,11 +1,11 @@
 # Local dev secrets for `wrangler dev`. Copy to `.dev.vars` (gitignored) and
-# fill in. In production MIRROR_SECRET is set via `wrangler secret put
-# MIRROR_SECRET` (or the Deploy to Cloudflare button, which prompts for it).
-# MIRROR_USER is a plain (non-secret) var — see wrangler.jsonc — but can be
-# overridden here too for local dev.
+# fill in. In production both are set via `wrangler secret put` (or the
+# Deploy to Cloudflare button, which prompts for both). Both are secrets, not
+# plain wrangler.jsonc `vars` — see the comment there for why (a plain var
+# gets silently overwritten on every deploy).
 
 # Basic-auth username every request must present alongside MIRROR_SECRET.
-MIRROR_USER=mirror
+MIRROR_USER=
 
 # Basic-auth password every request must present. Generate with:
 #   openssl rand -hex 32

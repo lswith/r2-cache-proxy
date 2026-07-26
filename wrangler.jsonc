@@ -24,15 +24,16 @@
   // Lazy read-through cache of any URL-addressed artifact. Objects are keyed
   // by the upstream URL minus scheme (e.g. `github.com/org/repo/v1.tar.gz`).
   "r2_buckets": [{ "binding": "MIRROR", "bucket_name": "r2-cache-proxy" }],
-  // Basic-auth username. Not secret (it's committed here and visible to
-  // anyone who can read this repo/deploy) — the real credential is
-  // MIRROR_SECRET below. Change it here, or override it after deploy from
-  // the dashboard (Settings → Variables and Secrets).
-  "vars": { "MIRROR_USER": "mirror" },
-  // Required secret (set via `wrangler secret put MIRROR_SECRET`, or the
-  // Deploy to Cloudflare button will prompt for it): the Basic-auth password
-  // every request must present alongside MIRROR_USER. `wrangler deploy` fails
-  // fast if it's missing. Without valid credentials the worker returns 401
-  // before doing any R2 or upstream work.
-  "secrets": { "required": ["MIRROR_SECRET"] }
+  // Both required secrets (set via `wrangler secret put`, or the Deploy to
+  // Cloudflare button will prompt for both): the Basic-auth username/password
+  // every request must present. `wrangler deploy` fails fast if either is
+  // missing. Without valid credentials the worker returns 401 before doing
+  // any R2 or upstream work.
+  //
+  // MIRROR_USER is deliberately a secret, not a plain `vars` entry: Wrangler
+  // treats `vars` in this file as the source of truth and re-applies it on
+  // every deploy, silently overwriting any value set via the dashboard. A
+  // secret is never touched by a config-driven deploy, so it's safe to set
+  // once (here or in the dashboard) and never worry about it reverting.
+  "secrets": { "required": ["MIRROR_USER", "MIRROR_SECRET"] }
 }
